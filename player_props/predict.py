@@ -101,11 +101,47 @@ def load_players():
 
 def load_schedule():
     """Load upcoming games schedule."""
-    schedule_path = DATA_DIR / 'nfl_schedule_2025.csv'
-    if not schedule_path.exists():
-        print(f"❌ Schedule not found: {schedule_path}")
+    # Choose the most recent schedule file (e.g. nfl_schedule_2026.csv)
+    schedule_files = list(DATA_DIR.glob('nfl_schedule_*.csv'))
+    if not schedule_files:
+        print(f"❌ No schedule files found in {DATA_DIR}")
         return None
-    
+
+    # Prefer a schedule file that includes the current year in its filename
+    current_year = pd.Timestamp.now(tz='UTC').year
+    preferred = None
+    for p in sorted(schedule_files, reverse=True):
+        name = p.name
+        if str(current_year) in name:
+            # ensure file has content beyond header
+            try:
+                with p.open('r', encoding='utf-8') as fh:
+                    if len(fh.readlines()) > 1:
+                        preferred = p
+                        break
+            except Exception:
+                continue
+
+    # If no year-matching file, pick the newest non-empty CSV
+    if preferred is None:
+        for p in sorted(schedule_files, reverse=True):
+            try:
+                # Quick check: file has more than just a header
+                with p.open('r', encoding='utf-8') as fh:
+                    lines = fh.readlines()
+                    if len(lines) > 1:
+                        preferred = p
+                        break
+            except Exception:
+                continue
+
+    if preferred is None:
+        # Fall back to the most recently modified file
+        schedule_path = max(schedule_files, key=lambda p: p.stat().st_mtime)
+    else:
+        schedule_path = preferred
+
+    print(f"Using schedule file: {schedule_path.name}")
     df = pd.read_csv(schedule_path)
     df['game_date'] = pd.to_datetime(df['date'])
     
@@ -350,12 +386,25 @@ def get_player_features(stats_df, player_name, team, prop_type, opponent=None, i
     else:
         return None
     
-    # Build base features
+    # Build base features, include std and target_share fields when present
     features = {
         f'{stat_col}_L3': latest.get(f'{stat_col}_L3'),
         f'{stat_col}_L5': latest.get(f'{stat_col}_L5'),
         f'{stat_col}_L10': latest.get(f'{stat_col}_L10')
     }
+
+    # Include std-of-L5 and target_share fields if they exist in the stats
+    std_field = f'{stat_col}_std_L5'
+    if std_field in latest.index:
+        features[std_field] = latest.get(std_field)
+
+    # Some stats include a 'target_share' series (receiving), include recent L3/L5 if available
+    if 'target_share_L3' in latest.index:
+        features['target_share_L3'] = latest.get('target_share_L3')
+    if 'target_share_L5' in latest.index:
+        features['target_share_L5'] = latest.get('target_share_L5')
+    if 'target_share_L10' in latest.index:
+        features['target_share_L10'] = latest.get('target_share_L10')
     
     # Add position-specific features
     if stat_type == 'passing':
@@ -851,9 +900,23 @@ def predict_props_for_game(game_row, all_stats, models):
                 model_line_value = model_info['line_value']
                 
                 try:
-                    # Prepare features as DataFrame
+                    # Prepare features as DataFrame and align to model's expected feature names
                     feature_df = pd.DataFrame([features])
-                    
+
+                    # Align DataFrame columns to what the model was trained on
+                    try:
+                        booster = model_info['model'].get_booster()
+                        expected_cols = list(booster.feature_names)
+                    except Exception:
+                        # Fallback: if we can't read feature names, use current columns
+                        expected_cols = list(feature_df.columns)
+
+                    # Add missing expected cols with default 0 and drop extras
+                    for col in expected_cols:
+                        if col not in feature_df.columns:
+                            feature_df[col] = 0
+                    feature_df = feature_df[expected_cols]
+
                     # Make prediction using model's trained threshold
                     prob_over = model_info['model'].predict_proba(feature_df)[0, 1]
                     
