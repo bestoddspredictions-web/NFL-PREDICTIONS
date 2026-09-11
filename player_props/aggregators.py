@@ -19,29 +19,49 @@ DATA_DIR = Path(__file__).parent.parent / 'data_files'
 def aggregate_passing_stats(pbp: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregate passing stats by player and game.
-    
+
+    Pass attempt counting follows official NFL box-score convention:
+    sacks are NOT counted as passing attempts.  In nflverse play-by-play
+    data every sack row carries pass_attempt=1, but passing_yards is NaN
+    on those rows (sack yardage is booked as the QB's rushing_yards).
+    We zero out pass_attempt on sack rows before summing so that the
+    resulting attempts column matches official totals.  Passing yards,
+    completions, TDs, and interceptions are unaffected.
+
     Args:
         pbp: Play-by-play DataFrame
-    
+
     Returns:
-        DataFrame with columns: 
+        DataFrame with columns:
             [player_id, player_name, game_id, season, week, game_date,
-             team, opponent, passing_yards, pass_tds, completions, 
+             team, opponent, passing_yards, pass_tds, completions,
              attempts, interceptions, completion_pct]
     """
     # Filter to passing plays only
     passing_plays = pbp[pbp['passer_player_id'].notna()].copy()
-    
+
     if passing_plays.empty:
         print("⚠️  No passing plays found in dataset")
         return pd.DataFrame()
-    
+
+    # Build a sack-adjusted attempt column.
+    # Official NFL stats exclude sacks from pass attempt totals; nflverse
+    # codes sacks with pass_attempt=1, so we zero those rows out here.
+    # passing_yards is already NaN on sack rows (no yards to correct).
+    if 'sack' in passing_plays.columns:
+        passing_plays['pass_attempt_adj'] = passing_plays['pass_attempt'].where(
+            passing_plays['sack'] != 1, other=0
+        )
+    else:
+        # Fallback if column is somehow absent — behaviour unchanged
+        passing_plays['pass_attempt_adj'] = passing_plays['pass_attempt']
+
     # Aggregate by player and game
     agg_stats = passing_plays.groupby([
-        'passer_player_id', 
-        'passer_player_name', 
-        'game_id', 
-        'season', 
+        'passer_player_id',
+        'passer_player_name',
+        'game_id',
+        'season',
         'week',
         'posteam',  # Team the player is on
         'defteam'   # Opponent
@@ -49,30 +69,30 @@ def aggregate_passing_stats(pbp: pd.DataFrame) -> pd.DataFrame:
         'passing_yards': 'sum',
         'pass_touchdown': 'sum',
         'complete_pass': 'sum',
-        'pass_attempt': 'sum',
+        'pass_attempt_adj': 'sum',  # sack-excluded attempt count
         'interception': 'sum',
         'game_date': 'first'  # Get game date
     }).reset_index()
-    
+
     # Rename columns
     agg_stats.columns = [
         'player_id', 'player_name', 'game_id', 'season', 'week',
-        'team', 'opponent', 'passing_yards', 'pass_tds', 
+        'team', 'opponent', 'passing_yards', 'pass_tds',
         'completions', 'attempts', 'interceptions', 'game_date'
     ]
-    
-    # Calculate completion percentage
+
+    # Calculate completion percentage using the corrected attempt count
     agg_stats['completion_pct'] = (
         agg_stats['completions'] / agg_stats['attempts'] * 100
     ).round(1)
-    
+
     # Sort by date
     agg_stats = agg_stats.sort_values(['player_id', 'season', 'week'])
-    
+
     print(f"✅ Aggregated {len(agg_stats):,} player-game passing records")
     print(f"   Players: {agg_stats['player_id'].nunique():,}")
     print(f"   Games: {agg_stats['game_id'].nunique():,}")
-    
+
     return agg_stats
 
 
@@ -201,9 +221,19 @@ def calculate_rolling_averages(
     player_id_col: str = 'player_id'
 ) -> pd.DataFrame:
     """
-    Calculate exponentially-weighted rolling averages for stat columns.
-    More recent games get higher weight for better prediction accuracy.
-    
+    Calculate exponentially-weighted rolling averages AND rolling standard
+    deviations (volatility) for stat columns. More recent games get higher
+    weight for better prediction accuracy.
+
+    The std columns capture how *consistent* a player has been recently,
+    separately from how *good* they've been. Two players can have the same
+    L5 average but very different week-to-week variance -- one hovers near
+    that number every game, the other alternates between huge and tiny
+    games. That distinction is exactly what a simple average can't see, and
+    it matters most for players sitting right at a prop line, where the
+    "over/under" call is decided by how much they swing, not just their
+    average.
+
     Args:
         player_stats: Game-level player stats (must have player_id, season, week)
         stat_cols: List of stat columns to calculate rolling averages for
@@ -211,8 +241,9 @@ def calculate_rolling_averages(
         player_id_col: Column name for player ID
     
     Returns:
-        DataFrame with additional columns for exponentially-weighted rolling averages
-        (e.g., passing_yards_L3, passing_yards_L5)
+        DataFrame with additional columns for exponentially-weighted rolling
+        averages (e.g., passing_yards_L3, passing_yards_L5) and rolling
+        standard deviations (e.g., passing_yards_std_L5)
     """
     # Ensure sorted by player and time
     player_stats = player_stats.sort_values([player_id_col, 'season', 'week']).copy()
@@ -231,8 +262,23 @@ def calculate_rolling_averages(
             player_stats[col_name] = player_stats.groupby(player_id_col, observed=False)[stat_col].transform(
                 lambda x: x.shift(1).ewm(span=window, adjust=False).mean()
             )
+
+        # Rolling volatility: only compute at the L5 window. L3 has too few
+        # points for a stable std estimate, and L10 mostly duplicates what
+        # L5 already captures for this purpose -- one well-chosen window
+        # keeps the feature set from ballooning for a secondary signal.
+        if 5 in windows:
+            std_col_name = f'{stat_col}_std_L5'
+            player_stats[std_col_name] = player_stats.groupby(player_id_col, observed=False)[stat_col].transform(
+                lambda x: x.shift(1).ewm(span=5, adjust=False).std()
+            )
+            # A player's first couple of games have no prior std (needs 2+
+            # points); fill with 0 rather than leaving NaN, which would
+            # otherwise cause those rows to be dropped entirely downstream.
+            player_stats[std_col_name] = player_stats[std_col_name].fillna(0.0)
     
     print(f"✅ Calculated exponentially-weighted rolling averages: windows={windows}, alpha={alpha:.3f}")
+    print(f"✅ Calculated rolling volatility (std) at L5 for: {[c for c in stat_cols if c in player_stats.columns]}")
     
     return player_stats
 
@@ -293,58 +339,63 @@ def add_matchup_features(df: pd.DataFrame, stat_type: str, all_stats: Dict[str, 
     # opponent_def_rank: rolling defense rank for this stat category
     # ------------------------------------------------------------------
     df['opponent_def_rank'] = df.apply(
-        lambda row: get_opponent_defense_rank_static(row['opponent'], stat_type, all_stats),
+        lambda row: get_opponent_defense_rank_static(
+            row['opponent'], stat_type, all_stats, row['season'], row['week']
+        ),
         axis=1
     )
 
     return df
 
 
-def get_opponent_defense_rank_static(opponent: str, stat_type: str, all_stats: Dict[str, pd.DataFrame]) -> int:
+def get_opponent_defense_rank_static(
+    opponent: str,
+    stat_type: str,
+    all_stats: Dict[str, pd.DataFrame],
+    season: int,
+    week: int,
+) -> int:
     """
     Calculate opponent's defensive ranking for a stat type (static version for training).
     Lower rank = better defense (harder matchup).
+
+    IMPORTANT: Only uses games strictly BEFORE (season, week) to avoid leaking
+    future information into a historical row's features. A row from Week 3 must
+    never be influenced by how that opponent played in Week 15.
     """
-    if stat_type == 'passing':
-        stats_df = all_stats.get('passing')
-        if stats_df is None or stats_df.empty:
-            return 16  # Default to league average
-        
-        # Get all passing yards allowed by this opponent
-        opp_games = stats_df[stats_df['opponent'] == opponent]
-        if opp_games.empty:
-            return 16
-        
-        avg_allowed = opp_games['passing_yards'].mean()
-        # Simple ranking based on average allowed
-        # In real implementation, this would be more sophisticated
-        return min(32, max(1, int(avg_allowed / 200)))  # Rough ranking
-    
-    elif stat_type == 'rushing':
-        stats_df = all_stats.get('rushing')
-        if stats_df is None or stats_df.empty:
-            return 16
-        
-        opp_games = stats_df[stats_df['opponent'] == opponent]
-        if opp_games.empty:
-            return 16
-        
-        avg_allowed = opp_games['rushing_yards'].mean()
-        return min(32, max(1, int(avg_allowed / 100)))
-    
-    elif stat_type == 'receiving':
-        stats_df = all_stats.get('receiving')
-        if stats_df is None or stats_df.empty:
-            return 16
-        
-        opp_games = stats_df[stats_df['opponent'] == opponent]
-        if opp_games.empty:
-            return 16
-        
-        avg_allowed = opp_games['receiving_yards'].mean()
-        return min(32, max(1, int(avg_allowed / 200)))
-    
-    return 16  # Default
+    stat_col_map = {
+        'passing': 'passing_yards',
+        'rushing': 'rushing_yards',
+        'receiving': 'receiving_yards',
+    }
+    divisor_map = {
+        'passing': 200,
+        'rushing': 100,
+        'receiving': 200,
+    }
+
+    if stat_type not in stat_col_map:
+        return 16  # Default
+
+    stats_df = all_stats.get(stat_type)
+    if stats_df is None or stats_df.empty:
+        return 16  # Default to league average
+
+    # Only games strictly before this (season, week) — prevents future leakage
+    prior_games = stats_df[
+        (stats_df['opponent'] == opponent) &
+        (
+            (stats_df['season'] < season) |
+            ((stats_df['season'] == season) & (stats_df['week'] < week))
+        )
+    ]
+    if prior_games.empty:
+        return 16  # No prior data yet (e.g. Week 1) — fall back to league average
+
+    stat_col = stat_col_map[stat_type]
+    avg_allowed = prior_games[stat_col].mean()
+    divisor = divisor_map[stat_type]
+    return min(32, max(1, int(avg_allowed / divisor)))
 
 
 def aggregate_all_stats(

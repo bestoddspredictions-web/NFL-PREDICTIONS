@@ -52,13 +52,31 @@ REQUIRED_PBP_COLS = [
 
 
 def _load_pbp() -> pd.DataFrame:
-    """Load play-by-play data from data_files/."""
+    """
+    Load play-by-play data from data_files/.
+
+    This file (like nfl_games_historical.csv alongside it) comes from the
+    NFLverse pipeline and is tab-separated, not comma-separated. Reading it
+    as plain CSV (the pandas default) breaks the moment any text field
+    contains a literal comma -- e.g. a play description like
+    "Pass complete, 5 yards" -- which pandas then misreads as an extra
+    column, raising "Expected N fields, saw N+1". We try tab-separated
+    first since that's the known format, and fall back to comma-separated
+    for robustness in case a differently-sourced file is ever dropped in.
+    """
+    def _read(path):
+        try:
+            return pd.read_csv(path, compression='infer', sep='\t', low_memory=False)
+        except pd.errors.ParserError:
+            print(f"   Warning: tab-separated parse failed for {path}, retrying as comma-separated")
+            return pd.read_csv(path, compression='infer', low_memory=False)
+
     if PBP_FILE.exists():
         print(f"Loading PBP from {PBP_FILE} ...")
-        pbp = pd.read_csv(PBP_FILE, compression='gzip', low_memory=False)
+        pbp = _read(PBP_FILE)
     elif PBP_FILE_UNCOMPRESSED.exists():
         print(f"Loading PBP from {PBP_FILE_UNCOMPRESSED} ...")
-        pbp = pd.read_csv(PBP_FILE_UNCOMPRESSED, low_memory=False)
+        pbp = _read(PBP_FILE_UNCOMPRESSED)
     else:
         raise FileNotFoundError(
             f"Play-by-play file not found. Expected one of:\n"

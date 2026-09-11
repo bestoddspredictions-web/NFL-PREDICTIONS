@@ -14,6 +14,7 @@ import xgboost as xgb
 sys.path.append(str(Path(__file__).parent.parent))
 
 from footer import add_betting_oracle_footer
+from team_names import expand_team, get_unmapped
 
 # Page config
 
@@ -204,6 +205,93 @@ def load_player_props_predictions():
         df['injury_note'] = None
     
     return df
+
+
+@st.cache_data(ttl=3600)
+def load_walk_forward_metrics():
+    """Load walk-forward cross-validation metrics for model reliability badges.
+
+    Returns a dict mapping model_name -> dict(mean_auc, std_auc, n_folds,
+    reliability_tier).  If the file is missing, returns an empty dict (callers
+    must handle the Unknown-tier fallback).
+    """
+    metrics_path = Path('player_props/models/walk_forward_metrics.csv')
+    if not metrics_path.exists():
+        return {}  # Caller falls back to 'Unknown'
+    try:
+        df = pd.read_csv(metrics_path)
+        result = {}
+        for _, row in df.iterrows():
+            std = float(row['std_auc'])
+            if std < 0.04:
+                tier = 'High'
+            elif std < 0.08:
+                tier = 'Medium'
+            else:
+                tier = 'Low'
+            result[str(row['model_name'])] = {
+                'mean_auc': float(row['mean_auc']),
+                'std_auc': std,
+                'n_folds': int(row['n_folds']),
+                'reliability_tier': tier,
+            }
+        return result
+    except Exception:
+        return {}  # Fail open — never crash the page
+
+
+def get_reliability_badge(model_name: str, metrics: dict) -> str:
+    """Return an emoji-labelled reliability string for a model.
+
+    Thresholds (std_auc):
+      High    < 0.04   -> 'High'
+      Medium  0.04-0.08 -> 'Medium'
+      Low     >= 0.08  -> 'Low'
+      Unknown model not in metrics CSV -> 'Unknown'
+
+    These thresholds directly reflect the structural pattern observed in
+    walk-forward evaluation: starter-tier models (large populations) cluster
+    below 0.03 std, elite-tier models (small populations) frequently exceed 0.08.
+    """
+    _BADGE = {
+        'High':    '🟢 High',
+        'Medium':  '🟡 Medium',
+        'Low':     '🔴 Low',
+        'Unknown': '⚪ Unknown',
+    }
+    if not metrics or model_name not in metrics:
+        return _BADGE['Unknown']
+    return _BADGE[metrics[model_name]['reliability_tier']]
+
+
+def _build_reliability_line(prop_type: str, tier_suffix: str, metrics: dict) -> str:
+    """Build the human-readable reliability line for the detail card HTML block.
+
+    Args:
+        prop_type:    e.g. 'passing_yards'
+        tier_suffix:  e.g. 'elite_qb', 'starter'  (the tier variable in the DK tab)
+        metrics:      dict returned by load_walk_forward_metrics()
+
+    Returns:
+        Plain-text string (safe to embed inside an HTML <p> tag), e.g.:
+            'Model reliability: 🟢 High (based on 5 historical test splits)'
+    """
+    model_name = f"{prop_type}_{tier_suffix}" if tier_suffix else prop_type
+    badge = get_reliability_badge(model_name, metrics)
+
+    if not metrics or model_name not in metrics:
+        suffix = "(reliability not yet measured)"
+    else:
+        info = metrics[model_name]
+        rel_tier = info['reliability_tier']
+        n = info['n_folds']
+        if rel_tier == 'Low':
+            suffix = f"(small sample size \u2014 treat this prediction with caution)"
+        else:
+            suffix = f"(based on {n} historical test splits)"
+
+    return f"Model reliability: {badge} {suffix}"
+
 
 def get_dataframe_height(df, row_height=35, header_height=38, padding=2, max_height=600):
     """
@@ -420,6 +508,10 @@ def main():
             if not filtered.empty:
                 # Format display columns
                 display_df = filtered.copy()
+                # Expand team abbreviations to full names — display layer only;
+                # internal filtering still uses abbreviations on filtered/predictions.
+                display_df['team'] = display_df['team'].apply(expand_team)
+                display_df['opponent'] = display_df['opponent'].apply(expand_team)
                 display_df['Confidence'] = display_df['confidence'].apply(lambda x: f"{x:.1%}")
                 display_df['Recommendation'] = display_df.apply(
                     lambda row: f"{row['recommendation']} {row['line_value']:.1f}", axis=1
@@ -433,17 +525,28 @@ def main():
                 display_df['Defense Rank'] = display_df['opponent_def_rank'].apply(
                     lambda x: f"#{int(x)}/32" + (" 🛡️" if x <= 8 else (" ⚠️" if x >= 24 else ""))
                 )
-                
+
+                # --- Model Reliability badge (additive, does not touch Tier) ---
+                wf_metrics = load_walk_forward_metrics()
+                if not wf_metrics:
+                    st.caption("⚪ Reliability data not available (walk_forward_metrics.csv not found).")
+                def _model_name_from_row(row):
+                    prop = row.get('prop_type', '')
+                    lt = row.get('line_type', '')
+                    return get_reliability_badge(f"{prop}_{lt}", wf_metrics)
+                display_df['Model Reliability'] = display_df.apply(_model_name_from_row, axis=1)
+
                 # Add injury information if available
                 if 'injury_note' in display_df.columns:
                     display_df['Injury Status'] = display_df['injury_note'].fillna('')
                 else:
                     display_df['Injury Status'] = ''
-                
+
                 # Select columns to show
                 show_cols = [
-                    'display_name', 'position', 'team', 'opponent', 'Defense Rank', 'trend', 'prop_type', 
-                    'Recommendation', 'Confidence', 'Tier', 'Last 3 Avg', 'Last 5 Avg', 'Last 10 Avg', 'weather_conditions', 'Injury Status'
+                    'display_name', 'position', 'team', 'opponent', 'Defense Rank', 'trend', 'prop_type',
+                    'Recommendation', 'Confidence', 'Tier', 'Model Reliability',
+                    'Last 3 Avg', 'Last 5 Avg', 'Last 10 Avg', 'weather_conditions', 'Injury Status'
                 ]
                 
                 height = get_dataframe_height(display_df[show_cols])
@@ -472,22 +575,32 @@ def main():
                     st.markdown("""
                     **Confidence Tiers:**
                     - 🔥 **Elite (≥65%)**: Highest confidence predictions
-                    - 💪 **Strong (60-65%)**: Very good predictions  
+                    - 💪 **Strong (60-65%)**: Very good predictions
                     - ✅ **Good (55-60%)**: Solid predictions above breakeven
-                    
+
+                    **Model Reliability (🟢/🟡/🔴) — different from Confidence above:**
+                    Reflects how *consistently* this type of prediction has scored across multiple
+                    historical test splits, not how confident the model is about this specific pick.
+                    A 🔴 Low reliability pick can still show high confidence %, but that confidence
+                    number has been less consistently accurate historically.
+                    - 🟢 **High** (std AUC < 0.04): Very stable across all test folds — starter-tier models
+                    - 🟡 **Medium** (std AUC 0.04–0.08): Moderate consistency
+                    - 🔴 **Low** (std AUC ≥ 0.08): High variance across folds — elite-tier models with small sample sizes
+                    - ⚪ **Unknown**: Reliability not yet measured for this model
+
                     **Recommendation Format:**
                     - `OVER 225.5` means the model predicts the player will go OVER this yardage line
                     - `UNDER 65.5` means the model predicts the player will go UNDER this yardage line
-                    
+
                     **Recent Averages:**
                     - **Last 3/Last 5 Avg**: Player's average performance over Last 3/5 games
                     - Compare to the line value to gauge difficulty
-                    
+
                     **Weather Impact:**
                     - **Weather**: Shows weather conditions for outdoor games (temperature, wind, precipitation)
                     - Weather adjustments are automatically applied to predictions for outdoor stadiums
                     - Dome games show "Dome" with no weather impact
-                    
+
                     **Model Info:**
                     - Trained on 2020-2025 historical data
                     - Uses rolling averages, TDs, completions, attempts as features
@@ -808,6 +921,7 @@ def main():
                     </div>
                     <div style="margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid rgba(255,255,255,0.2);">
                         <p style="margin: 0; font-size: 1rem;">Confidence: <strong>{confidence:.1%}</strong> ({prediction_source})</p>
+                        <p style="margin: 0.3rem 0 0 0; font-size: 1rem;">{_build_reliability_line(prop_type, tier, load_walk_forward_metrics())}</p>
                         <p style="margin: 0.5rem 0 0 0; font-size: 0.9rem; opacity: 0.8;">
                             Historical: {total_games} games ({games_over} over, {games_under} under)
                         </p>
@@ -864,6 +978,7 @@ def main():
                     display_cols.append(td_col)
                 
                 game_log = recent_games[display_cols].copy()
+                game_log['opponent'] = game_log['opponent'].apply(expand_team)
                 game_log['Result'] = game_log[stat_col].apply(
                     lambda x: f"{'✅ OVER' if x > dk_line else '❌ UNDER'} ({x:.1f})"
                 )
@@ -932,10 +1047,20 @@ def main():
                     st.markdown("""
                     **Confidence Tiers:**
                     - 🔥 **ELITE (≥65%)**: Highest confidence picks
-                    - 💪 **STRONG (60-65%)**: Very confident picks  
+                    - 💪 **STRONG (60-65%)**: Very confident picks
                     - ✅ **GOOD (55-60%)**: Solid picks above breakeven
                     - ⚠️ **LEAN (<55%)**: Lower confidence
-                    
+
+                    **Model Reliability (🟢/🟡/🔴) — different from Confidence above:**
+                    Reflects how *consistently* this type of prediction has scored across multiple
+                    historical test splits, not how confident the model is about this specific pick.
+                    A 🔴 Low reliability pick can still show high confidence %, but that confidence
+                    number has been less consistently accurate historically.
+                    - 🟢 **High** (std AUC < 0.04): Stable across all folds (starter-tier models)
+                    - 🟡 **Medium** (std AUC 0.04–0.08): Moderate consistency
+                    - 🔴 **Low** (std AUC ≥ 0.08): High variance — elite-tier, small sample size
+                    - ⚪ **Unknown**: Reliability not yet measured
+
                     **Pro Tips:**
                     - Model auto-selects tier based on season average
                     - Recent form (L3/L5) weighted heavily
@@ -1023,6 +1148,7 @@ def main():
                     'player_name', 'position', 'team', 'games_played', 'passing_yards', 'yards_per_game',
                     'pass_tds', 'interceptions', 'completions', 'attempts', 'completion_pct'
                 ]].copy()
+                display_df['team'] = display_df['team'].apply(expand_team)
                 
                 # Rename columns
                 display_df.columns = [
@@ -1092,6 +1218,7 @@ def main():
                     'player_name', 'position', 'team', 'games_played', 'rushing_yards', 'yards_per_game',
                     'rush_tds', 'rush_attempts', 'yards_per_carry', 'att_per_game'
                 ]].copy()
+                display_df['team'] = display_df['team'].apply(expand_team)
                 
                 # Rename columns
                 display_df.columns = [
@@ -1163,6 +1290,7 @@ def main():
                     'player_name', 'position', 'team', 'games_played', 'receiving_yards', 'yards_per_game',
                     'receptions', 'rec_tds', 'targets', 'yards_per_rec', 'catch_rate'
                 ]].copy()
+                display_df['team'] = display_df['team'].apply(expand_team)
                 
                 # Rename columns
                 display_df.columns = [
@@ -1267,8 +1395,10 @@ def main():
                                 player_pass = player_pass[player_pass['season'] == 2025]
                             display_cols = ['week', 'opponent', 'passing_yards', 'pass_tds', 'completions', 'attempts', 'interceptions']
                             available = [c for c in display_cols if c in player_pass.columns]
+                            pass_disp = player_pass[available].copy()
+                            pass_disp['opponent'] = pass_disp['opponent'].apply(expand_team)
                             st.dataframe(
-                                player_pass[available].rename(columns={
+                                pass_disp.rename(columns={
                                     'week': 'Wk',
                                     'opponent': 'Opp',
                                     'passing_yards': 'Yds',
@@ -1295,8 +1425,10 @@ def main():
                                 player_rush = player_rush[player_rush['season'] == 2025]
                             display_cols = ['week', 'opponent', 'rushing_yards', 'rush_tds', 'rush_attempts']
                             available = [c for c in display_cols if c in player_rush.columns]
+                            rush_disp = player_rush[available].copy()
+                            rush_disp['opponent'] = rush_disp['opponent'].apply(expand_team)
                             st.dataframe(
-                                player_rush[available].rename(columns={
+                                rush_disp.rename(columns={
                                     'week': 'Wk',
                                     'opponent': 'Opp',
                                     'rushing_yards': 'Yds',
@@ -1321,8 +1453,10 @@ def main():
                                 player_rec = player_rec[player_rec['season'] == 2025]
                             display_cols = ['week', 'opponent', 'receiving_yards', 'receptions', 'rec_tds', 'targets']
                             available = [c for c in display_cols if c in player_rec.columns]
+                            rec_disp = player_rec[available].copy()
+                            rec_disp['opponent'] = rec_disp['opponent'].apply(expand_team)
                             st.dataframe(
-                                player_rec[available].rename(columns={
+                                rec_disp.rename(columns={
                                     'week': 'Wk',
                                     'opponent': 'Opp',
                                     'receiving_yards': 'Yds',
