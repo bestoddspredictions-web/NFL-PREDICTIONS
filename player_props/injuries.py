@@ -1,13 +1,17 @@
 """
-NFL Injury Data Scraper
-Scrapes injury reports from ESPN.com for player prop adjustments.
+NFL injury data source with nflreadpy as the primary provider and ESPN as a fallback.
 """
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import time
 from pathlib import Path
 import warnings
+
+try:
+    from nflreadpy import load_injuries as nflreadpy_load_injuries
+except Exception:
+    nflreadpy_load_injuries = None
+
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -124,48 +128,120 @@ def scrape_espn_injuries():
 
 def clean_injury_data(df):
     """
-    Clean and standardize injury data
+    Clean and standardize injury data.
 
-    Args:
-        df (pd.DataFrame): Raw injury data
-
-    Returns:
-        pd.DataFrame: Cleaned injury data
+    This accepts either the legacy ESPN schema or nflreadpy's schema and normalizes
+    them into the contract expected by the rest of the app.
     """
-    if df.empty:
-        return df
+    if df is None:
+        return pd.DataFrame()
 
-    # Standardize status values
-    status_mapping = {
-        'questionable': 'Questionable',
-        'probable': 'Probable',
-        'doubtful': 'Doubtful',
-        'out': 'Out',
-        'injured reserve': 'IR',
-        'pup': 'PUP',
-        'nf-inj': 'NFI',
-        'suspended': 'Suspended'
+    if hasattr(df, 'shape') and len(df) == 0:
+        return pd.DataFrame()
+
+    # nflreadpy often returns a Polars DataFrame. Convert it before any pandas-only
+    # operations like .copy() / column map calls.
+    if hasattr(df, 'to_pandas'):
+        try:
+            df = df.to_pandas()
+        except Exception:
+            pass
+
+    if not isinstance(df, pd.DataFrame):
+        try:
+            df = pd.DataFrame(df)
+        except Exception:
+            return pd.DataFrame()
+
+    # Standardize / normalize column names first.
+    rename_map = {
+        'full_name': 'player_name',
+        'display_name': 'player_name',
+        'player': 'player_name',
+        'status': 'status',
+        'report_status': 'status',
+        'practice_status': 'practice_participation',
+        'practice_participation': 'practice_participation',
+        'report_primary_injury': 'injury_type',
+        'injury_type': 'injury_type',
+        'team_abbr': 'team',
+        'team': 'team',
+        'position': 'position',
     }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    df['status'] = df['status'].str.lower().map(status_mapping).fillna(df['status'])
+    if 'player_name' not in df.columns and 'full_name' in df.columns:
+        df['player_name'] = df['full_name']
 
-    # Standardize practice participation
-    practice_mapping = {
-        'full': 'Full',
-        'limited': 'Limited',
-        'dnp': 'DNP',
-        'did not participate': 'DNP',
-        'out': 'Out'
-    }
+    if 'status' not in df.columns:
+        df['status'] = ''
+    if 'practice_participation' not in df.columns:
+        df['practice_participation'] = ''
+    if 'injury_type' not in df.columns:
+        df['injury_type'] = ''
+    if 'team' not in df.columns:
+        df['team'] = ''
+    if 'position' not in df.columns:
+        df['position'] = ''
 
-    df['practice_participation'] = df['practice_participation'].str.lower().map(practice_mapping).fillna(df['practice_participation'])
+    # Convert common nflreadpy values into the app's expected text.
+    def normalize_status(value):
+        if value is None:
+            return ''
+        text = str(value).strip()
+        if not text or text.lower() in {'nan', 'none', 'null'}:
+            return ''
+        text = text.lower()
+        mapping = {
+            'questionable': 'Questionable',
+            'probable': 'Probable',
+            'doubtful': 'Doubtful',
+            'out': 'Out',
+            'did not participate in practice': 'DNP',
+            'limited participation in practice': 'Limited',
+            'full participation in practice': 'Full',
+            'injured reserve': 'IR',
+            'pup': 'PUP',
+            'nf-inj': 'NFI',
+            'nfi': 'NFI',
+            'suspended': 'Suspended',
+        }
+        return mapping.get(text, text.title())
 
-    # Clean player names (remove extra spaces, standardize format)
-    df['player_name'] = df['player_name'].str.strip()
+    def normalize_practice(value):
+        if value is None:
+            return ''
+        text = str(value).strip()
+        if not text or text.lower() in {'nan', 'none', 'null'}:
+            return ''
+        text = text.lower()
+        mapping = {
+            'did not participate in practice': 'DNP',
+            'limited participation in practice': 'Limited',
+            'full participation in practice': 'Full',
+            'missing': 'Missing',
+            'full': 'Full',
+            'limited': 'Limited',
+            'dnp': 'DNP',
+            'out': 'Out',
+        }
+        return mapping.get(text, text.title())
 
-    # Add timestamp
+    df['status'] = df['status'].map(normalize_status).fillna('')
+    df['practice_participation'] = df['practice_participation'].map(normalize_practice).fillna('')
+    df['injury_type'] = df['injury_type'].fillna('').astype(str).str.strip()
+    df['player_name'] = df['player_name'].fillna('').astype(str).str.strip()
+    df['team'] = df['team'].fillna('').astype(str).str.strip()
+    df['position'] = df['position'].fillna('').astype(str).str.strip()
+
+    # Backfill status from practice participation when no official designation is set.
+    if 'status' in df.columns and 'practice_participation' in df.columns:
+        mask = df['status'].fillna('').astype(str).str.strip().eq('')
+        df.loc[mask, 'status'] = df.loc[mask, 'practice_participation']
+
+    # Add timestamp and source metadata
     df['scraped_at'] = pd.Timestamp.now()
-
+    df['source'] = 'nflreadpy' if 'source' not in df.columns else df['source']
     return df
 
 
@@ -225,40 +301,43 @@ def load_cached_injuries(max_age_hours=6):
 
 def get_injury_report(use_cache=True, max_cache_age_hours=6):
     """
-    Get current NFL injury report
+    Get current NFL injury report.
 
-    Args:
-        use_cache (bool): Whether to use cached data if available
-        max_cache_age_hours (int): Maximum age of cached data
-
-    Returns:
-        pd.DataFrame: Current injury data
+    Primary source: nflreadpy.load_injuries()
+    Fallback: ESPN scraping if nflreadpy is unavailable or empty.
     """
-    # Try to load cached data first
     if use_cache:
         cached_data = load_cached_injuries(max_cache_age_hours)
         if cached_data is not None:
             return cached_data
 
-    # Scrape fresh data
-    raw_data = scrape_espn_injuries()
+    raw_data = pd.DataFrame()
+    try:
+        if nflreadpy_load_injuries is not None:
+            raw_data = nflreadpy_load_injuries()
+            print(f"📊 nflreadpy returned {len(raw_data)} injury rows")
+    except Exception as exc:
+        print(f"⚠️  nflreadpy failed: {exc}")
 
-    if not raw_data.empty:
-        # Clean the data
+    if raw_data is not None and hasattr(raw_data, '__len__') and len(raw_data) > 0:
         clean_data = clean_injury_data(raw_data)
+        if not clean_data.empty:
+            save_injuries_to_csv(clean_data)
+            return clean_data
 
-        # Save to cache
+    print("⚠️  nflreadpy returned no usable rows; trying ESPN fallback...")
+    raw_data = scrape_espn_injuries()
+    if not raw_data.empty:
+        clean_data = clean_injury_data(raw_data)
         save_injuries_to_csv(clean_data)
-
         return clean_data
-    else:
-        # Return cached data as fallback if scraping fails
-        print("⚠️  Scraping failed, trying cached data as fallback...")
-        cached_fallback = load_cached_injuries(max_age_hours=24)  # Allow older data as fallback
-        if cached_fallback is not None:
-            return cached_fallback
 
-        return pd.DataFrame()
+    print("⚠️  No live data available, trying cached data as fallback...")
+    cached_fallback = load_cached_injuries(max_age_hours=24)
+    if cached_fallback is not None:
+        return cached_fallback
+
+    return pd.DataFrame()
 
 
 def find_player_injury(player_name, injuries_df):
@@ -312,8 +391,14 @@ def adjust_prediction_for_injury(prediction, injury_info):
     status = str(injury_info.get('status', '')).lower() if injury_info.get('status') is not None else ''
     practice = str(injury_info.get('practice_participation', '')).lower() if injury_info.get('practice_participation') is not None else ''
 
+    # Keep compatibility with both legacy ESPN and nflreadpy payloads.
+    if status in ['', 'nan', 'none'] and 'report_status' in injury_info:
+        status = str(injury_info.get('report_status', '')).lower()
+    if practice in ['', 'nan', 'none'] and 'practice_status' in injury_info:
+        practice = str(injury_info.get('practice_status', '')).lower()
+
     # Player is out - remove prediction entirely
-    if status in ['out', 'ir', 'pup', 'nfi', 'suspended'] or practice == 'out':
+    if status in ['out', 'ir', 'pup', 'nfi', 'suspended'] or practice in ['out', 'did not participate in practice', 'dnp']:
         return None
 
     # Questionable players - reduce confidence
