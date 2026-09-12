@@ -4,11 +4,18 @@ from os import path
 from datetime import datetime
 
 DATA_DIR = 'data_files/'
-# Use 2025 for the current NFL season (starts in 2025, playoffs in 2026)
-season_year = 2025
+# Determine season year dynamically based on today's date:
+# - If month is Sep(9)-Dec(12): season_year = current year
+# - If month is Jan(1)-Aug(8): season_year = current year - 1
+# This follows the convention that the season is named after the year it starts.
+today = datetime.utcnow().date()
+if today.month >= 9:
+	season_year = today.year
+else:
+	season_year = today.year - 1
 
 # Fetch schedule for current season
-print(f"Fetching NFL schedule for {season_year}...")
+print(f"Fetching NFL schedule for {season_year} (determined from today's date: {today})...")
 schedule = nfl.import_schedules([season_year])
 print("Columns in schedule:", schedule.columns.tolist())
 

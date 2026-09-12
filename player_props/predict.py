@@ -7,6 +7,7 @@ import numpy as np
 from pathlib import Path
 import xgboost as xgb
 from datetime import datetime, timezone
+import time
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -151,18 +152,31 @@ def load_schedule():
     else:
         df['game_date'] = df['game_date'].dt.tz_convert('UTC')
     
-    # Try to get upcoming games
+    # Only predict the actionable current/next NFL week, not the full remaining season.
+    # For a game that's already started or finished, prediction is no longer useful.
     now_utc = pd.Timestamp.now(tz='UTC')
     cutoff = now_utc - pd.Timedelta(hours=12)
-    upcoming = df[df['game_date'] >= cutoff].copy()
-    
-    # If no upcoming games, use most recent week for demonstration
-    if upcoming.empty:
+
+    future_games = df[df['game_date'] >= cutoff].copy()
+
+    if future_games.empty:
         print("⚠️  No upcoming games. Using most recent week for demonstration...")
-        max_week = df['week'].max()
-        upcoming = df[df['week'] == max_week].copy()
-    
-    print(f"✅ Found {len(upcoming)} games (Week {upcoming['week'].iloc[0] if len(upcoming) > 0 else 'N/A'})")
+        max_week = pd.to_numeric(df['week'], errors='coerce').max()
+        upcoming = df[pd.to_numeric(df['week'], errors='coerce') == max_week].copy()
+    else:
+        week_values = pd.to_numeric(future_games['week'], errors='coerce')
+        target_week = int(week_values.min())
+        upcoming = future_games[week_values == target_week].copy()
+
+    # Keep only games that are still actionable for prediction in the selected week.
+    # This avoids returning a whole-season slate, and avoids predicting games that already started/finished.
+    upcoming = upcoming[upcoming['game_date'] >= cutoff].copy()
+
+    if upcoming.empty:
+        print("⚠️  No actionable games remain in the selected week.")
+        return upcoming
+
+    print(f"✅ Found {len(upcoming)} actionable games in Week {int(pd.to_numeric(upcoming['week'], errors='coerce').iloc[0])}")
     return upcoming
 
 
@@ -824,7 +838,7 @@ def get_player_performance_tier(player_name, prop_type, all_stats):
     return 'starter'
 
 
-def predict_props_for_game(game_row, all_stats, models):
+def predict_props_for_game(game_row, all_stats, models, injuries_df):
     """
     Generate prop predictions for all players in a game.
     """
@@ -834,9 +848,20 @@ def predict_props_for_game(game_row, all_stats, models):
     game_date = game_row['game_date']
     week = game_row['week']
     
-    # Load injury data for adjustment
-    injuries_df = get_injury_report()
-    
+    # Get weather for the game once
+    t_weather_start = time.time()
+    try:
+        game_date_str = str(game_date) if hasattr(game_date, 'strftime') else str(game_date)
+        if len(game_date_str) > 10:
+            game_date_str = game_date_str[:10]
+        game_weather_data = get_weather_for_game(teams[0], game_row['venue'], game_date_str)
+    except Exception as e:
+        print(f"⚠️ Failed to get weather for game: {e}")
+        game_weather_data = None
+    t_weather_end = time.time()
+    weather_time = t_weather_end - t_weather_start
+        
+    t_model_start = time.time()
     for team in teams:
         opponent = game_row['away_team'] if team == game_row['home_team'] else game_row['home_team']
         is_home = team == game_row['home_team']
@@ -978,20 +1003,15 @@ def predict_props_for_game(game_row, all_stats, models):
                         
                         # Apply weather adjustments for outdoor games
                         try:
-                            # Ensure game_date is a string
-                            game_date_str = str(game_date) if hasattr(game_date, 'strftime') else str(game_date)
-                            if len(game_date_str) > 10:  # If it has time component, extract date only
-                                game_date_str = game_date_str[:10]
-                            weather_data = get_weather_for_game(team, game_row['venue'], game_date_str)
-                            if not weather_data.get('is_dome', False):
+                            if game_weather_data and not game_weather_data.get('is_dome', False):
                                 original_prob = prediction['prob_over']
-                                adjusted_prob = adjust_for_weather(original_prob, prop_type, weather_data)
+                                adjusted_prob = adjust_for_weather(original_prob, prop_type, game_weather_data)
                                 prediction['prob_over'] = adjusted_prob
                                 prediction['prob_under'] = 1 - adjusted_prob
                                 prediction['confidence'] = max(adjusted_prob, 1 - adjusted_prob)
                                 prediction['recommendation'] = 'OVER' if adjusted_prob >= MIN_CONFIDENCE else 'UNDER'
                                 prediction['weather_adjusted'] = True
-                                prediction['weather_conditions'] = f"{weather_data['temp_f']:.0f}°F, {weather_data['wind_mph']:.1f} mph wind"
+                                prediction['weather_conditions'] = f"{game_weather_data['temp_f']:.0f}°F, {game_weather_data['wind_mph']:.1f} mph wind"
                             else:
                                 prediction['weather_adjusted'] = False
                                 prediction['weather_conditions'] = "Dome"
@@ -1006,6 +1026,10 @@ def predict_props_for_game(game_row, all_stats, models):
                     # Skip if prediction fails (missing features, etc.)
                     print(f"⚠️  Prediction failed for {player_name} {prop_type}: {e}")
                     continue
+    
+    t_model_end = time.time()
+    model_time = t_model_end - t_model_start
+    print(f"   [Profile] Weather API: {weather_time:.2f}s | Model loop: {model_time:.2f}s")
     
     return predictions
 
@@ -1022,6 +1046,7 @@ def generate_predictions():
     print()
     
     # Load data
+    t_data_start = time.time()
     print("📂 Loading data...")
     schedule = load_schedule()
     if schedule is None or schedule.empty:
@@ -1030,6 +1055,8 @@ def generate_predictions():
     
     all_stats = load_player_stats()
     models = load_models()
+    t_data_end = time.time()
+    print(f"   [Profile] Data & Models loading: {t_data_end - t_data_start:.2f}s")
     
     if not models:
         print("❌ No models found. Run 'python player_props/models.py' first")
@@ -1042,13 +1069,21 @@ def generate_predictions():
     # Generate predictions for each game
     all_predictions = []
     
+    # Fetch injury data once for all games
+    t_injury_start = time.time()
+    injuries_df = get_injury_report()
+    t_injury_end = time.time()
+    print(f"   [Profile] Injury fetching: {t_injury_end - t_injury_start:.2f}s")
+    
     for idx, game_row in schedule.iterrows():
         print(f"\n📅 {game_row['away_team']} @ {game_row['home_team']} (Week {game_row['week']})")
         
-        game_predictions = predict_props_for_game(game_row, all_stats, models)
+        game_predictions = predict_props_for_game(game_row, all_stats, models, injuries_df)
         all_predictions.extend(game_predictions)
         
         print(f"   Generated {len(game_predictions)} prop predictions")
+        
+        break  # Only run one game for profiling
     
     # Save predictions
     if all_predictions:
